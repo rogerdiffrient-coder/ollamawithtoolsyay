@@ -17,16 +17,15 @@ const memoryStatusEl = $('#memoryStatus');
 const sidebar = $('#sidebar');
 const mobileOverlay = $('#mobileOverlay');
 
-// The model is explicitly told about this tool and can call it whenever it needs older context.
 const REMEMBER_TOOL = {
   type: 'function',
   function: {
     name: 'remember',
-    description: 'Search persistent conversation memory. Use this whenever you need to recall something from older messages, previous chats, past decisions, project details, preferences, names, or anything not confidently present in the current context. The tool performs semantic memory search when Ollama embeddings are available, then returns the matching chat area around the relevant message. You are explicitly allowed and encouraged to call this tool.',
+    description: 'Search persistent conversation memory when the user asks about older messages, another chat, a past decision, a forgotten detail, project history, preferences, names, or something not present in the current context. Do NOT use this for greetings, casual conversation, or questions you can answer from the current conversation. Never call this tool with an empty query.',
     parameters: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'A natural-language description of what you are trying to remember.' },
+        query: { type: 'string', description: 'A specific natural-language description of the older information you need to recall. Must not be empty.' },
         chat_id: { type: 'string', description: 'Optional chat ID to restrict the search.' }
       },
       required: ['query']
@@ -124,18 +123,37 @@ function renderActiveChat() {
     chatEl.appendChild(welcome); chatTitleEl.textContent = chat?.title || 'New chat'; return;
   }
   chatTitleEl.textContent = chat.title;
-  for (const message of chat.messages) if (message.role !== 'system' && message.role !== 'tool') addMessageElement(message.role, message.content || '');
+  for (const message of chat.messages) if (message.role !== 'system' && message.role !== 'tool') addMessageElement(message.role, message.content || '', message.thinking || '');
   scrollToBottom();
 }
 
-function addMessageElement(role, text = '') {
+function addMessageElement(role, text = '', thinking = '') {
   const wrapper = document.createElement('div'); wrapper.className = `message ${role}`;
   const row = document.createElement('div'); row.className = 'message-row';
   const avatar = document.createElement('div'); avatar.className = 'avatar'; avatar.textContent = role === 'user' ? 'Y' : '✦';
   const content = document.createElement('div'); content.className = 'message-content';
   const roleLabel = document.createElement('div'); roleLabel.className = 'role'; roleLabel.textContent = role === 'user' ? 'You' : 'AI';
+
+  if (role === 'assistant' && thinking) {
+    const details = document.createElement('details'); details.className = 'thinking-block';
+    const summary = document.createElement('summary'); summary.textContent = 'Thinking';
+    const thought = document.createElement('div'); thought.className = 'thinking-content'; thought.textContent = thinking;
+    details.append(summary, thought); content.appendChild(details);
+  }
+
   const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.textContent = text;
-  content.append(roleLabel, bubble); row.append(avatar, content); wrapper.appendChild(row); chatEl.appendChild(wrapper); return bubble;
+  content.append(roleLabel, bubble); row.append(avatar, content); wrapper.appendChild(row); chatEl.appendChild(wrapper); return { bubble, content };
+}
+
+function setThinkingElement(content, thinking) {
+  if (!thinking) return;
+  let details = content.querySelector('.thinking-block');
+  if (!details) {
+    details = document.createElement('details'); details.className = 'thinking-block';
+    const summary = document.createElement('summary'); summary.textContent = 'Thinking';
+    const thought = document.createElement('div'); thought.className = 'thinking-content'; details.append(summary, thought); content.insertBefore(details, content.querySelector('.bubble'));
+  }
+  details.querySelector('.thinking-content').textContent = thinking;
 }
 
 function scrollToBottom() { chatEl.scrollTop = chatEl.scrollHeight; }
@@ -163,21 +181,23 @@ function formatMemoryMessage(message) { return `[${message.role === 'user' ? 'Hu
 
 function getMemoryContext(chat) {
   const conversational = chat.messages.filter(m => m.role === 'user' || m.role === 'assistant');
-  const recent = conversational.slice(-10), older = conversational.slice(0, Math.max(0, conversational.length - 10));
+  const humans = conversational.filter(m => m.role === 'user').slice(-5);
+  const assistants = conversational.filter(m => m.role === 'assistant').slice(-5);
+  const recent = conversational.slice(-10);
+  const older = conversational.slice(0, Math.max(0, conversational.length - 10));
   const parts = [];
   if (chat.summary) parts.push(`CURRENT CHAT OLDER-MESSAGE SUMMARY:\n${chat.summary}`);
   if (older.length && !chat.summary) parts.push(`OLDER CURRENT-CHAT MESSAGES:\n${older.slice(-20).map(formatMemoryMessage).join('\n')}`);
-  if (recent.length) parts.push(`LAST 10 MESSAGES (up to 5 human + 5 AI messages):\n${recent.map(formatMemoryMessage).join('\n')}`);
+  if (recent.length) {
+    const balancedRecent = [...humans.map(m => ({ message: m, order: conversational.indexOf(m) })), ...assistants.map(m => ({ message: m, order: conversational.indexOf(m) }))].sort((a, b) => a.order - b.order).map(x => x.message);
+    parts.push(`RECENT CONTEXT (last 5 human + last 5 AI messages, when available):\n${balancedRecent.map(formatMemoryMessage).join('\n')}`);
+  }
   const previous = state.chats.filter(c => c.id !== chat.id && (c.summary || c.messages.length)).slice(0, 20);
   if (previous.length) parts.push(`PREVIOUS CHAT SUMMARIES:\n${previous.map(c => `- ${c.title}: ${c.summary || '(No summary yet; use remember to search this chat.)'}`).join('\n')}`);
   return parts.join('\n\n');
 }
 
 // ---------- Semantic memory ----------
-// Each message can be embedded locally by Ollama. remember() compares the query
-// embedding with those vectors, then returns the matching message plus neighbors.
-// If the selected model does not expose /api/embed, lexical search is used instead.
-
 function cosineSimilarity(a, b) {
   if (!a?.length || !b?.length || a.length !== b.length) return 0;
   let dot = 0, aa = 0, bb = 0;
@@ -193,6 +213,7 @@ function lexicalScore(text, query) {
 }
 
 async function getEmbedding(text, model) {
+  if (!text?.trim()) return null;
   const response = await fetch(`${OLLAMA}/api/embed`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model, input: text }) });
   if (!response.ok) throw new Error(`Embedding HTTP ${response.status}`);
   const data = await response.json(); return data.embeddings?.[0] || null;
@@ -210,6 +231,8 @@ async function indexMessage(chat, message) {
 }
 
 async function remember(query, chatId = '', model = modelSelect.value) {
+  query = String(query || '').trim();
+  if (!query) return { found: false, skipped: true, message: 'No memory search was performed because the query was empty. Answer the user normally.' };
   const chats = chatId ? state.chats.filter(c => c.id === chatId) : state.chats;
   if (!chats.length) return { found: false, message: 'There are no saved chats to search.' };
   let queryEmbedding = null; try { queryEmbedding = await getEmbedding(query, model); } catch (_) {}
@@ -235,8 +258,9 @@ async function remember(query, chatId = '', model = modelSelect.value) {
   return { found: true, query, results, instruction: 'Use these retrieved messages as factual remembered context. Do not invent details that are not present in the results.' };
 }
 
-async function ollamaChat(messages, model, stream = true, includeTools = true) {
-  const body = { model, messages, stream }; if (includeTools) body.tools = [REMEMBER_TOOL];
+async function ollamaChat(messages, model, stream = true, includeTools = true, think = true) {
+  const body = { model, messages, stream, think };
+  if (includeTools) body.tools = [REMEMBER_TOOL];
   const response = await fetch(`${OLLAMA}/api/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!response.ok) throw new Error(`HTTP ${response.status}`); return response;
 }
@@ -246,7 +270,7 @@ async function summarizeChat(chat, model) {
   const older = conversational.slice(0, -10);
   const prompt = `Create a compact factual memory summary of these older conversation messages. Preserve important facts, decisions, project details, preferences, names, and unresolved tasks. Do not invent anything.\n\n${older.map(formatMemoryMessage).join('\n')}`;
   try {
-    const response = await ollamaChat([{ role: 'system', content: 'You write compact conversation memory summaries. Return only the summary.' }, { role: 'user', content: prompt }], model, false, false);
+    const response = await ollamaChat([{ role: 'system', content: 'You write compact conversation memory summaries. Return only the summary.' }, { role: 'user', content: prompt }], model, false, false, false);
     const data = await response.json(); if (data.message?.content) chat.summary = data.message.content.trim();
   } catch (error) { console.warn('Memory summary update failed:', error); }
 }
@@ -258,38 +282,48 @@ async function sendMessage(text) {
   const userMessage = { id: uid(), role: 'user', content: text };
   chat.messages.push(userMessage); chat.updatedAt = Date.now(); saveState(); renderChatList();
   if (!chatEl.querySelector('.message')) renderActiveChat(); else addMessageElement('user', text);
-  const bubble = addMessageElement('assistant', ''); isGenerating = true; sendButton.disabled = true; input.disabled = true; statusEl.textContent = 'Thinking…';
+  const assistantUI = addMessageElement('assistant', '');
+  const bubble = assistantUI.bubble;
+  const messageContent = assistantUI.content;
+  isGenerating = true; sendButton.disabled = true; input.disabled = true; statusEl.textContent = 'Thinking…';
 
   try {
     await indexMessage(chat, userMessage);
-    const system = `You are a helpful local AI inside Ollama Chat. You have persistent local conversation memory.\n\nMEMORY TOOL RULE: You have a tool named remember. CALL remember whenever the user asks about something from an older message, another chat, a past decision, a forgotten detail, project history, preferences, names, or anything you cannot confidently answer from the context below. The tool searches saved chats and returns the relevant conversation area. You are explicitly allowed and encouraged to use it. Never pretend to remember something you have not been given or retrieved.\n\nMEMORY CONTEXT:\n${getMemoryContext(chat) || '(No saved memory yet.)'}`;
+    const system = `You are a helpful local AI inside Ollama Chat. Respond naturally and conversationally.\n\nTHINKING: You have thinking support. When useful, think through difficult questions before answering. Your thinking is shown in a collapsible Thinking block when the model provides it. For simple greetings and casual conversation, answer directly without unnecessary reasoning.\n\nMEMORY TOOL: You have a tool named remember for persistent conversation memory. Use it ONLY when the user's request genuinely requires information from older messages or another chat that is not confidently present in the current context. Do NOT call it for greetings, simple questions, casual conversation, or information already visible in the current context. NEVER call it with an empty query. If no older information is needed, just answer normally.\n\nMEMORY CONTEXT:\n${getMemoryContext(chat) || '(No saved memory yet.)'}`;
     const workingMessages = [{ role: 'system', content: system }, ...chat.messages];
-    let answer = '', rounds = 0;
+    let answer = '', thinking = '', rounds = 0;
 
     while (rounds++ < 4) {
-      const response = await ollamaChat(workingMessages, model, true, true), reader = response.body.getReader(), decoder = new TextDecoder();
-      let buffer = '', roundText = ''; const toolCalls = [];
+      const response = await ollamaChat(workingMessages, model, true, true, true), reader = response.body.getReader(), decoder = new TextDecoder();
+      let buffer = '', roundText = '', roundThinking = ''; const toolCalls = [];
       while (true) {
         const { value, done } = await reader.read(); if (done) break;
         buffer += decoder.decode(value, { stream: true }); const lines = buffer.split('\n'); buffer = lines.pop();
         for (const line of lines) {
           if (!line.trim()) continue; const chunk = JSON.parse(line), message = chunk.message || {};
-          roundText += message.content || ''; if (Array.isArray(message.tool_calls)) toolCalls.push(...message.tool_calls);
-          bubble.textContent = answer + roundText; scrollToBottom();
+          roundText += message.content || '';
+          roundThinking += message.thinking || '';
+          if (Array.isArray(message.tool_calls)) toolCalls.push(...message.tool_calls);
+          bubble.textContent = answer + roundText;
+          if (roundThinking) setThinkingElement(messageContent, thinking + roundThinking);
+          scrollToBottom();
         }
       }
+      thinking += roundThinking;
       if (!toolCalls.length) { answer += roundText; break; }
-      workingMessages.push({ role: 'assistant', content: roundText, tool_calls: toolCalls });
+      workingMessages.push({ role: 'assistant', content: roundText, thinking: roundThinking || undefined, tool_calls: toolCalls });
       for (const call of toolCalls) {
         if (call.function?.name !== 'remember') continue;
         let args = {}; try { args = typeof call.function.arguments === 'string' ? JSON.parse(call.function.arguments) : (call.function.arguments || {}); } catch (_) {}
-        const result = await remember(args.query || '', args.chat_id || '', model);
+        const query = String(args.query || '').trim();
+        const result = query ? await remember(query, args.chat_id || '', model) : { found: false, skipped: true, message: 'Empty memory query ignored. Continue answering the user normally without memory.' };
         workingMessages.push({ role: 'tool', tool_name: 'remember', content: JSON.stringify(result) });
       }
       answer += roundText;
     }
 
     const assistantMessage = { id: uid(), role: 'assistant', content: answer || '(No response)' };
+    if (thinking) assistantMessage.thinking = thinking;
     chat.messages.push(assistantMessage); chat.updatedAt = Date.now(); saveState(); renderChatList(); bubble.textContent = assistantMessage.content;
     await summarizeChat(chat, model); saveState();
     for (const message of chat.messages.slice(-12)) await indexMessage(chat, message);
